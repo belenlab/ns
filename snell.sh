@@ -14,6 +14,7 @@ SNELL_DIR="/etc/snell"
 SNELL_CONF="${SNELL_DIR}/snell-server.conf"
 SNELL_BIN="${SNELL_DIR}/snell-server"
 SNELL_SERVICE="/etc/systemd/system/snell.service"
+SYSCTL_BBR_CONF="/etc/sysctl.d/99-snell-bbr.conf"
 # =================================================
 
 # 颜色
@@ -119,8 +120,6 @@ has_snell_config_key() {
 }
 
 # 根据 ipv6 设置返回对应的 listen 监听地址前缀
-# - ipv6 = true  → 用 ::0 (双栈监听,Linux 默认同时接受 IPv4)
-# - ipv6 = false → 用 0.0.0.0 (仅 IPv4)
 get_listen_prefix() {
     local ipv6=$1
     if [[ "$ipv6" == "true" ]]; then
@@ -225,13 +224,10 @@ set_snell_config_key() {
     fi
 }
 
-# 注释掉某个键(把 "key = value" 改成 "# key = value")
-# 如果当前没有该键的有效行,但有注释行,保留注释不动
-# 如果都没有,什么都不做
+# 注释掉某个键
 comment_snell_config_key() {
     local key=$1
     
-    # 如果存在未注释的键,把它注释掉
     if has_snell_config_key "$key"; then
         awk -v key="$key" '
             $0 ~ "^"key"[[:space:]]*=" {
@@ -243,20 +239,16 @@ comment_snell_config_key() {
     fi
 }
 
-# 取消注释某个键(注释行 → 未注释)
-# 如果未找到注释行,但传入了 fallback_value,则追加一行
+# 取消注释某个键
 uncomment_snell_config_key() {
     local key=$1
     local fallback_value=${2:-}
     
-    # 已经有未注释的有效行,直接返回
     if has_snell_config_key "$key"; then
         return
     fi
     
-    # 查找注释行(以 # 开头,后面跟该键)
     if grep -qE "^#[[:space:]]*${key}[[:space:]]*=" "$SNELL_CONF"; then
-        # 把注释行取消注释(只取消第一个匹配)
         awk -v key="$key" '
             !done && $0 ~ "^#[[:space:]]*"key"[[:space:]]*=" {
                 sub(/^#[[:space:]]*/, "")
@@ -265,7 +257,6 @@ uncomment_snell_config_key() {
             { print }
         ' "$SNELL_CONF" > "${SNELL_CONF}.tmp" && mv "${SNELL_CONF}.tmp" "$SNELL_CONF"
     elif [[ -n "$fallback_value" ]]; then
-        # 没注释行也没有效行,追加
         echo "${key} = ${fallback_value}" >> "$SNELL_CONF"
     fi
 }
@@ -274,9 +265,9 @@ uncomment_snell_config_key() {
 write_snell_conf() {
     local port=$1
     local psk=$2
-    local ipv6=$3       # true / false
-    local dns=$4        # 空字符串表示注释掉
-    local tfo=$5        # true / false
+    local ipv6=$3
+    local dns=$4
+    local tfo=$5
     
     local listen_prefix
     listen_prefix=$(get_listen_prefix "$ipv6")
@@ -296,7 +287,7 @@ write_snell_conf() {
     } > "$SNELL_CONF"
 }
 
-# 根据 ipv6 设置更新 listen 行的监听地址前缀,保留端口
+# 根据 ipv6 设置更新 listen 行,保留端口
 update_listen_for_ipv6() {
     local ipv6=$1
     local port
@@ -324,6 +315,48 @@ update_listen_port() {
         /^listen[[:space:]]*=/ { print line; next }
         { print }
     ' "$SNELL_CONF" > "${SNELL_CONF}.tmp" && mv "${SNELL_CONF}.tmp" "$SNELL_CONF"
+}
+
+# 启用 BBR(兼容 Ubuntu 22+/24+/26 等新系统,以及 Debian 11/12+)
+enable_bbr() {
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    
+    log_info "检查 BBR 状态..."
+    
+    if [[ "$current_cc" == "bbr" ]]; then
+        log_ok "BBR 已启用,跳过"
+        return
+    fi
+    
+    log_info "启用 BBR..."
+    
+    # 清理可能存在的旧配置(老版本脚本可能写入过 /etc/sysctl.conf)
+    if [[ -f /etc/sysctl.conf ]]; then
+        sed -i '/^net\.core\.default_qdisc[[:space:]]*=/d' /etc/sysctl.conf
+        sed -i '/^net\.ipv4\.tcp_congestion_control[[:space:]]*=/d' /etc/sysctl.conf
+    fi
+    
+    # 确保 /etc/sysctl.d 目录存在
+    mkdir -p /etc/sysctl.d
+    
+    # 写入独立配置文件
+    cat > "$SYSCTL_BBR_CONF" <<EOF
+# BBR 拥塞控制 - 由 Snell 管理脚本添加
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    
+    # 应用配置
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_BBR_CONF" >/dev/null 2>&1
+    
+    local new_cc
+    new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$new_cc" == "bbr" ]]; then
+        log_ok "BBR 已启用(配置文件: $SYSCTL_BBR_CONF)"
+    else
+        log_warn "BBR 启用失败,当前算法: $new_cc(可能内核版本过低)"
+    fi
 }
 
 # ==================== 功能模块 ====================
@@ -660,7 +693,6 @@ change_dns() {
     
     if [[ "$new_dns" == "clear" ]]; then
         comment_snell_config_key "dns"
-        # 如果之前没有 dns 行,也确保有一行注释
         if ! grep -qE "^#[[:space:]]*dns[[:space:]]*=" "$SNELL_CONF"; then
             echo "# dns = 1.1.1.1, 8.8.8.8" >> "$SNELL_CONF"
         fi
@@ -673,9 +705,7 @@ change_dns() {
             return
         fi
         
-        # 如果原本是注释状态,先取消注释,然后赋值
         uncomment_snell_config_key "dns" "$new_dns"
-        # 再确保值正确
         set_snell_config_key "dns" "$new_dns"
         log_ok "DNS 已设置为: $new_dns"
     fi
@@ -752,7 +782,7 @@ uninstall_snell() {
     echo "  - 删除 $SNELL_SERVICE"
     echo
     echo "以下内容会保留:"
-    echo "  - BBR 内核参数(对系统其他服务也有益)"
+    echo "  - BBR 内核参数(配置文件 $SYSCTL_BBR_CONF,对系统其他服务也有益)"
     echo "  - 云厂商安全组规则(需自行删除)"
     echo
     read -p "确认卸载?(输入 yes 确认): " confirm
@@ -946,29 +976,10 @@ EOF
     
     # BBR
     echo
-    log_info "检查 BBR 状态..."
-    local current_cc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-    if [[ "$current_cc" == "bbr" ]]; then
-        log_ok "BBR 已启用,跳过"
-    else
-        log_info "启用 BBR..."
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p >/dev/null
-        
-        local new_cc
-        new_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-        if [[ "$new_cc" == "bbr" ]]; then
-            log_ok "BBR 已启用"
-        else
-            log_warn "BBR 启用失败,当前算法: $new_cc (可能内核版本过低)"
-        fi
-    fi
+    enable_bbr
     
     # 启动
+    echo
     log_info "启动 Snell 服务..."
     systemctl daemon-reload
     systemctl enable snell >/dev/null 2>&1
