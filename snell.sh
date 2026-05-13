@@ -647,7 +647,7 @@ change_dns() {
     echo
     echo "请输入新的 DNS 服务器:"
     echo "  - 多个 DNS 用逗号分隔(如: 1.1.1.1, 8.8.8.8)"
-    echo "  - 输入 '${YELLOW}clear${NC}' 清除 DNS 配置"
+    echo "  - 输入 ${RED}'clear'${NC} 清除 DNS 配置"
     echo "  - 直接回车取消"
     read -p "新 DNS: " new_dns
     
