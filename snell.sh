@@ -647,7 +647,7 @@ change_dns() {
     echo
     echo "请输入新的 DNS 服务器:"
     echo "  - 多个 DNS 用逗号分隔(如: 1.1.1.1, 8.8.8.8)"
-    echo "  - 输入 'clear' 清除 DNS 配置(注释掉,使用系统默认)"
+    echo "  - 输入 '${YELLOW}clear${NC}' 清除 DNS 配置"
     echo "  - 直接回车取消"
     read -p "新 DNS: " new_dns
     
@@ -861,7 +861,7 @@ install_snell() {
     echo
     echo "是否配置自定义 DNS?"
     echo "  - 推荐使用 1.1.1.1, 8.8.8.8 等稳定 DNS"
-    echo "  - 不配置则在配置文件中注释掉,使用系统默认 DNS"
+    echo "  - 不配置则使用系统默认 DNS"
     local dns
     if ask_yes_no "配置自定义 DNS?" "n"; then
         echo
@@ -1038,8 +1038,8 @@ main() {
         echo -e "检测到 Snell 已安装  状态: ${status_text}"
         echo
         echo "请选择操作:"
-        echo "  1) 查看配置文件路径和连接信息"
-        echo "  2) 查看服务管理命令"
+        echo "  1) 查看配置信息"
+        echo "  2) 查看管理命令"
         echo "  3) 重启 Snell 服务"
         echo "  4) 修改监听端口"
         echo "  5) 修改 PSK"
