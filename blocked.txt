@@ -13,3 +13,5 @@
 .charliemonroe.net
 .browser-intake-us5-datadoghq.com
 .books-analytics-events.apple.com
+.live.com
+.bing.com
