@@ -535,7 +535,7 @@ change_psk() {
     echo -e "当前 PSK: ${YELLOW}${old_psk}${NC}"
     echo
     echo "请输入新 PSK:"
-    echo "  - 直接回车将自动生成 31 位随机 PSK(snell-server wizard 规则)"
+    echo "  - 直接回车将自动生成 31 位随机 PSK"
     echo "  - 输入 'q' 取消"
     read -p "新 PSK: " new_psk
     
@@ -799,7 +799,7 @@ install_snell() {
     # PSK
     echo
     echo "请输入 PSK(预共享密钥)"
-    echo "  - 直接回车将自动生成 31 位随机 PSK(snell-server wizard 规则)"
+    echo "  - 直接回车将自动生成 31 位随机 PSK"
     echo "  - 也可以输入自定义 PSK(建议至少 16 字符)"
     read -p "PSK: " psk
     
