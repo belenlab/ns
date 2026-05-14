@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Snell 交互式管理脚本(Ubuntu / Debian)
-# 功能:安装 / 查看配置 / 重启 / 修改端口/PSK/IPv6/DNS/TFO / 卸载
+# 功能:安装 / 查看配置 / 重启 / 修改端口/PSK/IPv6/DNS / 卸载
 #
 
 set -e
@@ -14,7 +14,6 @@ SNELL_DIR="/etc/snell"
 SNELL_CONF="${SNELL_DIR}/snell-server.conf"
 SNELL_BIN="${SNELL_DIR}/snell-server"
 SNELL_SERVICE="/etc/systemd/system/snell.service"
-SYSCTL_BBR_CONF="/etc/sysctl.d/99-snell-bbr.conf"
 # =================================================
 
 # 颜色
@@ -76,6 +75,12 @@ is_snell_installed() {
     [[ -f "$SNELL_BIN" && -f "$SNELL_CONF" ]]
 }
 
+# 按 snell-server wizard 的规则生成 PSK
+# 规则:31 位,字符集 [A-Za-z0-9],读取 /dev/urandom 作为随机源
+generate_psk() {
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 31
+}
+
 # 读取端口:取最后一个 ':' 之后的内容(兼容 IPv4/IPv6 监听)
 get_snell_port() {
     if [[ -f "$SNELL_CONF" ]]; then
@@ -120,6 +125,8 @@ has_snell_config_key() {
 }
 
 # 根据 ipv6 设置返回对应的 listen 监听地址前缀
+# - ipv6 = true  → 用 ::0 (双栈监听,Linux 默认同时接受 IPv4)
+# - ipv6 = false → 用 0.0.0.0 (仅 IPv4)
 get_listen_prefix() {
     local ipv6=$1
     if [[ "$ipv6" == "true" ]]; then
@@ -224,10 +231,13 @@ set_snell_config_key() {
     fi
 }
 
-# 注释掉某个键
+# 注释掉某个键(把 "key = value" 改成 "# key = value")
+# 如果当前没有该键的有效行,但有注释行,保留注释不动
+# 如果都没有,什么都不做
 comment_snell_config_key() {
     local key=$1
     
+    # 如果存在未注释的键,把它注释掉
     if has_snell_config_key "$key"; then
         awk -v key="$key" '
             $0 ~ "^"key"[[:space:]]*=" {
@@ -239,16 +249,20 @@ comment_snell_config_key() {
     fi
 }
 
-# 取消注释某个键
+# 取消注释某个键(注释行 → 未注释)
+# 如果未找到注释行,但传入了 fallback_value,则追加一行
 uncomment_snell_config_key() {
     local key=$1
     local fallback_value=${2:-}
     
+    # 已经有未注释的有效行,直接返回
     if has_snell_config_key "$key"; then
         return
     fi
     
+    # 查找注释行(以 # 开头,后面跟该键)
     if grep -qE "^#[[:space:]]*${key}[[:space:]]*=" "$SNELL_CONF"; then
+        # 把注释行取消注释(只取消第一个匹配)
         awk -v key="$key" '
             !done && $0 ~ "^#[[:space:]]*"key"[[:space:]]*=" {
                 sub(/^#[[:space:]]*/, "")
@@ -257,6 +271,7 @@ uncomment_snell_config_key() {
             { print }
         ' "$SNELL_CONF" > "${SNELL_CONF}.tmp" && mv "${SNELL_CONF}.tmp" "$SNELL_CONF"
     elif [[ -n "$fallback_value" ]]; then
+        # 没注释行也没有效行,追加
         echo "${key} = ${fallback_value}" >> "$SNELL_CONF"
     fi
 }
@@ -265,9 +280,8 @@ uncomment_snell_config_key() {
 write_snell_conf() {
     local port=$1
     local psk=$2
-    local ipv6=$3
-    local dns=$4
-    local tfo=$5
+    local ipv6=$3       # true / false
+    local dns=$4        # 空字符串表示注释掉
     
     local listen_prefix
     listen_prefix=$(get_listen_prefix "$ipv6")
@@ -282,12 +296,11 @@ write_snell_conf() {
         else
             echo "# dns = 1.1.1.1, 8.8.8.8"
         fi
-        echo "tfo = ${tfo}"
         echo "# egress-interface = eth0"
     } > "$SNELL_CONF"
 }
 
-# 根据 ipv6 设置更新 listen 行,保留端口
+# 根据 ipv6 设置更新 listen 行的监听地址前缀,保留端口
 update_listen_for_ipv6() {
     local ipv6=$1
     local port
@@ -317,48 +330,6 @@ update_listen_port() {
     ' "$SNELL_CONF" > "${SNELL_CONF}.tmp" && mv "${SNELL_CONF}.tmp" "$SNELL_CONF"
 }
 
-# 启用 BBR(兼容 Ubuntu 22+/24+/26 等新系统,以及 Debian 11/12+)
-enable_bbr() {
-    local current_cc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    
-    log_info "检查 BBR 状态..."
-    
-    if [[ "$current_cc" == "bbr" ]]; then
-        log_ok "BBR 已启用,跳过"
-        return
-    fi
-    
-    log_info "启用 BBR..."
-    
-    # 清理可能存在的旧配置(老版本脚本可能写入过 /etc/sysctl.conf)
-    if [[ -f /etc/sysctl.conf ]]; then
-        sed -i '/^net\.core\.default_qdisc[[:space:]]*=/d' /etc/sysctl.conf
-        sed -i '/^net\.ipv4\.tcp_congestion_control[[:space:]]*=/d' /etc/sysctl.conf
-    fi
-    
-    # 确保 /etc/sysctl.d 目录存在
-    mkdir -p /etc/sysctl.d
-    
-    # 写入独立配置文件
-    cat > "$SYSCTL_BBR_CONF" <<EOF
-# BBR 拥塞控制 - 由 Snell 管理脚本添加
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-    
-    # 应用配置
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_BBR_CONF" >/dev/null 2>&1
-    
-    local new_cc
-    new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    if [[ "$new_cc" == "bbr" ]]; then
-        log_ok "BBR 已启用(配置文件: $SYSCTL_BBR_CONF)"
-    else
-        log_warn "BBR 启用失败,当前算法: $new_cc(可能内核版本过低)"
-    fi
-}
-
 # ==================== 功能模块 ====================
 
 show_config() {
@@ -367,13 +338,12 @@ show_config() {
     echo -e "${CYAN}Snell 配置信息${NC}"
     echo "============================================"
     
-    local port psk public_ip ipv6 dns tfo
+    local port psk public_ip ipv6 dns
     port=$(get_snell_port)
     psk=$(get_snell_psk)
     public_ip=$(get_public_ip)
     ipv6=$(get_snell_config_value "ipv6")
     dns=$(get_snell_config_value "dns")
-    tfo=$(get_snell_config_value "tfo")
     
     echo
     echo -e "${GREEN}文件路径:${NC}"
@@ -390,7 +360,6 @@ show_config() {
     echo -e "${GREEN}其他配置:${NC}"
     echo "  IPv6:       ${ipv6:-未配置}"
     echo "  DNS:        ${dns:-未配置(使用系统默认)}"
-    echo "  TFO:        ${tfo:-未配置}"
     echo
     echo -e "${GREEN}配置文件内容:${NC}"
     echo "  --------------------------------"
@@ -425,6 +394,22 @@ show_commands() {
     echo "  查看端口监听:    ss -tunlp | grep snell"
     echo "  检查 BBR 状态:   sysctl net.ipv4.tcp_congestion_control"
     echo "  查看进程:        ps aux | grep snell"
+    echo
+    echo -e "${GREEN}TCP Fast Open (内核 sysctl):${NC}"
+    echo "  查看 TFO 状态:   sysctl net.ipv4.tcp_fastopen"
+    echo "    返回值含义:"
+    echo "      0  = 完全禁用 TFO"
+    echo "      1  = 仅作为客户端启用(系统默认)"
+    echo "      2  = 仅作为服务端启用"
+    echo "      3  = 客户端和服务端都启用(Snell 服务端推荐)"
+    local current_tfo
+    current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "?")
+    echo "    当前值:        ${current_tfo}"
+    echo "  临时启用 (重启失效):   sysctl -w net.ipv4.tcp_fastopen=3"
+    echo "  永久启用 (写入配置):"
+    echo "    echo 'net.ipv4.tcp_fastopen=3' > /etc/sysctl.d/99-snell-tfo.conf"
+    echo "    sysctl --system"
+    echo "  注:Snell v5 服务端 TFO 由内核 sysctl 控制,conf 里的 tfo 字段已无效"
     echo
     echo -e "${GREEN}配置修改:${NC}"
     echo "  编辑配置:        nano $SNELL_CONF"
@@ -550,7 +535,7 @@ change_psk() {
     echo -e "当前 PSK: ${YELLOW}${old_psk}${NC}"
     echo
     echo "请输入新 PSK:"
-    echo "  - 直接回车将自动生成 64 位强随机 PSK(推荐)"
+    echo "  - 直接回车将自动生成 31 位随机 PSK(snell-server wizard 规则)"
     echo "  - 输入 'q' 取消"
     read -p "新 PSK: " new_psk
     
@@ -560,7 +545,7 @@ change_psk() {
     fi
     
     if [[ -z "$new_psk" ]]; then
-        new_psk=$(openssl rand -hex 32)
+        new_psk=$(generate_psk)
         log_ok "已生成新 PSK: $new_psk"
     fi
     
@@ -693,6 +678,7 @@ change_dns() {
     
     if [[ "$new_dns" == "clear" ]]; then
         comment_snell_config_key "dns"
+        # 如果之前没有 dns 行,也确保有一行注释
         if ! grep -qE "^#[[:space:]]*dns[[:space:]]*=" "$SNELL_CONF"; then
             echo "# dns = 1.1.1.1, 8.8.8.8" >> "$SNELL_CONF"
         fi
@@ -705,7 +691,9 @@ change_dns() {
             return
         fi
         
+        # 如果原本是注释状态,先取消注释,然后赋值
         uncomment_snell_config_key "dns" "$new_dns"
+        # 再确保值正确
         set_snell_config_key "dns" "$new_dns"
         log_ok "DNS 已设置为: $new_dns"
     fi
@@ -723,56 +711,6 @@ change_dns() {
     echo
 }
 
-change_tfo() {
-    local old_tfo
-    old_tfo=$(get_snell_config_value "tfo")
-    
-    echo
-    echo "============================================"
-    echo -e "${CYAN}修改 TFO(TCP Fast Open)设置${NC}"
-    echo "============================================"
-    echo
-    echo -e "当前 TFO: ${YELLOW}${old_tfo:-未配置}${NC}"
-    echo
-    echo "说明:TFO 可省一个 RTT 加速连接,但部分链路上可能反而变慢"
-    echo
-    
-    local new_tfo
-    if ask_yes_no "启用 TFO?" "n"; then
-        new_tfo="true"
-    else
-        new_tfo="false"
-    fi
-    
-    if [[ "$new_tfo" == "$old_tfo" ]]; then
-        log_warn "新设置与当前相同,无需修改"
-        return
-    fi
-    
-    echo
-    echo "即将设置 tfo = ${new_tfo} 并重启服务"
-    if ! ask_yes_no "确认修改?" "n"; then
-        log_info "已取消"
-        return
-    fi
-    
-    backup_conf
-    set_snell_config_key "tfo" "$new_tfo"
-    log_ok "配置文件已更新"
-    
-    log_info "重启 Snell 服务..."
-    systemctl restart snell
-    sleep 2
-    
-    if systemctl is-active --quiet snell; then
-        log_ok "TFO 已设置为 ${new_tfo}"
-    else
-        log_err "服务异常,查看日志:"
-        journalctl -u snell -n 20 --no-pager
-    fi
-    echo
-}
-
 uninstall_snell() {
     echo
     log_warn "即将卸载 Snell"
@@ -782,7 +720,7 @@ uninstall_snell() {
     echo "  - 删除 $SNELL_SERVICE"
     echo
     echo "以下内容会保留:"
-    echo "  - BBR 内核参数(配置文件 $SYSCTL_BBR_CONF,对系统其他服务也有益)"
+    echo "  - BBR 内核参数(对系统其他服务也有益)"
     echo "  - 云厂商安全组规则(需自行删除)"
     echo
     read -p "确认卸载?(输入 yes 确认): " confirm
@@ -861,13 +799,13 @@ install_snell() {
     # PSK
     echo
     echo "请输入 PSK(预共享密钥)"
-    echo "  - 直接回车将自动生成 64 位强随机 PSK(推荐)"
+    echo "  - 直接回车将自动生成 31 位随机 PSK(snell-server wizard 规则)"
     echo "  - 也可以输入自定义 PSK(建议至少 16 字符)"
     read -p "PSK: " psk
     
     if [[ -z "$psk" ]]; then
         log_info "自动生成 PSK..."
-        psk=$(openssl rand -hex 32)
+        psk=$(generate_psk)
         log_ok "PSK 已生成: $psk"
     else
         log_ok "使用自定义 PSK"
@@ -908,25 +846,12 @@ install_snell() {
         log_ok "DNS: 已注释(使用系统默认)"
     fi
     
-    # TFO
-    echo
-    echo "是否启用 TCP Fast Open?"
-    echo "  - 可加速连接,但部分链路上可能反而变慢"
-    local tfo
-    if ask_yes_no "启用 TFO?" "n"; then
-        tfo="true"
-        log_ok "TFO: 已启用"
-    else
-        tfo="false"
-        log_ok "TFO: 已禁用"
-    fi
-    
     # 依赖
     echo
     log_info "安装依赖工具..."
     export DEBIAN_FRONTEND=noninteractive
     apt update -qq
-    apt install -y -qq wget unzip openssl curl ca-certificates iproute2 >/dev/null
+    apt install -y -qq wget unzip curl ca-certificates iproute2 >/dev/null
     log_ok "依赖已就绪"
     
     # 下载
@@ -948,7 +873,7 @@ install_snell() {
     
     # 配置文件
     log_info "创建配置文件..."
-    write_snell_conf "$port" "$psk" "$ipv6" "$dns" "$tfo"
+    write_snell_conf "$port" "$psk" "$ipv6" "$dns"
     log_ok "配置文件已创建: $SNELL_CONF"
     
     # systemd
@@ -965,8 +890,8 @@ Group=nogroup
 LimitNOFILE=32768
 ExecStart=${SNELL_BIN} -c ${SNELL_CONF}
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-StandardOutput=syslog
-StandardError=syslog
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=snell-server
 
 [Install]
@@ -976,10 +901,29 @@ EOF
     
     # BBR
     echo
-    enable_bbr
+    log_info "检查 BBR 状态..."
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+    if [[ "$current_cc" == "bbr" ]]; then
+        log_ok "BBR 已启用,跳过"
+    else
+        log_info "启用 BBR..."
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p >/dev/null
+        
+        local new_cc
+        new_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+        if [[ "$new_cc" == "bbr" ]]; then
+            log_ok "BBR 已启用"
+        else
+            log_warn "BBR 启用失败,当前算法: $new_cc (可能内核版本过低)"
+        fi
+    fi
     
     # 启动
-    echo
     log_info "启动 Snell 服务..."
     systemctl daemon-reload
     systemctl enable snell >/dev/null 2>&1
@@ -1019,12 +963,14 @@ EOF
     echo "  监听地址:    ${listen_prefix}:${port}"
     echo "  IPv6:       ${ipv6}"
     echo "  DNS:        ${dns:-(已注释,使用系统默认)}"
-    echo "  TFO:        ${tfo}"
     echo
     echo -e "${YELLOW}重要提醒:${NC}"
     echo "  1. 请在云厂商控制台的安全组中放行 ${port} 端口的 TCP 和 UDP"
     echo "  2. 配置文件位置: ${SNELL_CONF}"
     echo "  3. 重新运行本脚本可管理服务"
+    echo "  4. 如需启用服务端 TFO,执行:"
+    echo "       echo 'net.ipv4.tcp_fastopen=3' > /etc/sysctl.d/99-snell-tfo.conf"
+    echo "       sysctl --system"
     echo
     echo "============================================"
 }
@@ -1056,13 +1002,12 @@ main() {
         echo "  5) 修改 PSK"
         echo "  6) 修改 IPv6 设置"
         echo "  7) 修改 DNS 设置"
-        echo "  8) 修改 TFO 设置"
-        echo "  9) 卸载 Snell"
+        echo "  8) 卸载 Snell"
         echo "  0) 退出"
         echo
         
         local choice
-        read -p "请输入选项 [0-9]: " choice
+        read -p "请输入选项 [0-8]: " choice
         
         case "$choice" in
             1) show_config ;;
@@ -1072,8 +1017,7 @@ main() {
             5) change_psk ;;
             6) change_ipv6 ;;
             7) change_dns ;;
-            8) change_tfo ;;
-            9) uninstall_snell ;;
+            8) uninstall_snell ;;
             0) log_info "已退出" ;;
             *) log_err "无效选项: $choice"; exit 1 ;;
         esac
