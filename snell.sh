@@ -409,10 +409,10 @@ show_commands() {
     echo "  永久启用 (写入配置):"
     echo "    echo 'net.ipv4.tcp_fastopen=3' > /etc/sysctl.d/99-snell-tfo.conf"
     echo "    sysctl --system"
-    echo "  注:Snell v5 服务端 TFO 由内核 sysctl 控制,conf 里的 tfo 字段已无效"
+    echo "  注:Snell 服务端 TFO 由内核 sysctl 控制"
     echo
     echo -e "${GREEN}配置修改:${NC}"
-    echo "  编辑配置:        nano $SNELL_CONF"
+    echo "  编辑配置:        vi $SNELL_CONF"
     echo "  修改后需重启:    systemctl restart snell"
     echo
     echo -e "${YELLOW}当前服务状态:${NC}"
@@ -967,10 +967,6 @@ EOF
     echo -e "${YELLOW}重要提醒:${NC}"
     echo "  1. 请在云厂商控制台的安全组中放行 ${port} 端口的 TCP 和 UDP"
     echo "  2. 配置文件位置: ${SNELL_CONF}"
-    echo "  3. 重新运行本脚本可管理服务"
-    echo "  4. 如需启用服务端 TFO,执行:"
-    echo "       echo 'net.ipv4.tcp_fastopen=3' > /etc/sysctl.d/99-snell-tfo.conf"
-    echo "       sysctl --system"
     echo
     echo "============================================"
 }
