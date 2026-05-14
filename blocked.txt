@@ -15,3 +15,5 @@
 .books-analytics-events.apple.com
 .live.com
 .bing.com
+.pwnedpasswords.com
+.skilljar.com
